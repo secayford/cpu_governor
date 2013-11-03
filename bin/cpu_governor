@@ -1,0 +1,264 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use POSIX qw( :sys_wait_h );
+
+=head1 NAME
+
+cpu_governor
+
+=head1 SYNOPSIS
+
+cpu_governor
+
+=head1 DESCRIPTION
+
+by Steve Cayford
+
+This program monitors specified processes for excessive cpu usage. If a monitored process
+exceeds the specified cpu usage range, then it will be restrained by the cpulimit command.
+
+cpulimit is an independent binary which should be available in your distribution.
+
+This version was written a few years ago and has some issues. I'm using it as-is for a starting
+point for a hopefully more accurate and thorough version.
+
+=head1 COPYRIGHT
+
+Copyright (C) 2013 Steve Cayford
+
+=head1 LICENSE
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see L<http://www.gnu.org/licenses/>.
+
+=cut
+
+# ---
+# Configuration variables
+# ---
+
+my $looptime  = 1;     # sleep time between checks - in seconds
+my $delaytime = 15;    # time process is allowed over limit before enforcing limit - in seconds
+my $cpulimit  = 30;    # percent of cpu a process is limited to
+
+my $log_file_path = '/var/log/cpu_governor.log';
+my $ps_bin        = '/bin/ps';
+my $cpulimit_bin  = '/usr/bin/cpulimit';
+
+# In order for processes to be limited, they must match one of the command names in
+# @limit_commands AND the user must not match any names in @ignored_users.
+
+# We don't limit any processes running under the @ignored_users.
+my @ignored_users = ( 'root', );
+
+# We only limit processes matching the "limit_commands" names.
+# Some processes don't like the way cpulimit works, especially
+# those run from the command line it seems.
+my @limit_commands = ( 'npviewer.bin', 'firefox', 'WINWORD.EXE', 'soffice.bin', 'abiword', 'acroread', );
+
+# ---
+# End of configuration variables
+# ---
+
+{
+    my $interactive;
+
+    sub interactive {
+        my ( $arg ) = @_;
+        if ( defined( $arg ) ) {
+            $interactive = ( $arg ) ? 1 : 0;
+        }
+        if ( !defined( $interactive ) ) {
+            if ( -t STDIN && -t STDOUT ) {
+                $interactive = 1;
+            } else {
+                $interactive = 0;
+            }
+        }
+        return $interactive;
+    }
+}
+
+{
+    my $log_file_fh;
+
+    sub log_message {
+        unless ( $log_file_fh ) {
+            open( $log_file_fh, '>>', $log_file_path )
+                or die "Error: Could not open log file $log_file_path ($!) \n";
+        }
+        if ( interactive() ) {
+            print STDERR @_;
+        }
+        print $log_file_fh @_;
+
+        return;
+    }
+}
+
+sub proc_str {
+    my ( $proc_ref ) = @_;
+    return join( ' ', @{$proc_ref}{ 'pid', 'pcpu', 'uid', 'user', 'comm' } );
+}
+
+sub update_watching_stash {
+    my ( $old_proc_stash, $now ) = @_;
+    my $new_proc_stash;
+    my $ps_fh;
+    my @ps_command = ( $ps_bin, '-eo', 'pid,pcpu,uid,user,comm', '--sort', '-pcpu' );
+    unless ( open( $ps_fh, '-|', @ps_command ) ) {
+        log_message( "Dying: can't fork: $!\n" );
+        die;
+    }
+
+PROCESS: while ( my $line = <$ps_fh> ) {
+
+        chomp $line;
+
+        # skip header
+        if ( $line =~ m/^ \s* PID \s+ /x ) {
+            next PROCESS;
+        }
+
+        if ( $line =~ m/^ \s* (\d+) \s+ (-?[\d\.]+) \s+ (\d+) \s+ (\S+) \s+ (.+) $/x ) {
+            my %process;
+            @process{ 'pid', 'pcpu', 'uid', 'user', 'comm' } = ( $1, $2, $3, $4, $5 );
+
+            if ( $process{pcpu} > $cpulimit ) {
+                if ( $old_proc_stash->{ $process{pid} } ) {
+
+                    # already watching this one
+                    $process{tag_time} = $old_proc_stash->{ $process{pid} }{tag_time};
+                } else {
+                    $process{tag_time} = $now;
+                }
+                $new_proc_stash->{ $process{pid} } = \%process;
+            } else {
+
+                # since in order by cpu usage, there are no more over the limit this round
+                last PROCESS;
+            }
+        } else {
+            log_message( "Error: unrecognized process line: $line\n" );
+        }
+    }
+    close( $ps_fh );
+    return $new_proc_stash;
+}
+
+sub get_dead_children {
+    my @proc_list;
+
+    while ( my $child_proc = waitpid( -1, WNOHANG ) ) {
+        if ( $child_proc < 1 ) {
+            last;
+        }
+        push @proc_list, $child_proc;
+    }
+
+    return @proc_list;
+}
+
+sub limit {
+    my ( $proc_num ) = @_;
+
+    my @cpulimit_cmd = ( $cpulimit_bin, '-z', '-l', $cpulimit, '-p', $proc_num );
+
+    my $child = fork;
+    if ( !defined $child ) {
+        log_message( "Dying: Failed to fork a sub process!\n" );
+        die "Failed to fork a sub process!\n";
+    } elsif ( !$child ) {
+
+        # we're the child
+        {
+            exec @cpulimit_cmd;
+        }
+        log_message( "Dying: Failed to run cpulimit: $!\n" );
+        die "Failed to run cpulimit: $!\n";
+    } else {
+
+        # we're the parent
+        return $child;
+    }
+
+}
+
+
+$SIG{TERM} = sub {
+    log_message( 'Exiting CPU Governor on TERM signal ', scalar( localtime( time ) ), "\n" );
+    exit 1;
+};
+
+$SIG{INT} = sub {
+    log_message( 'Exiting CPU Governor on INT signal ', scalar( localtime( time ) ), "\n" );
+    exit 1;
+};
+
+# lists of processes we're watching
+my $watching_stash  = {};    # over the usage, waiting to see if they go over delaytime
+my $offending_stash = {};    # over the usage and over the delaytime
+my $child_stash     = {};    # our cpulimit child processes
+
+
+log_message( 'Starting CPU Governor ', scalar( localtime( time ) ), "\n" );
+
+# loop forever
+MAINLOOP: while ( 1 ) {
+
+    sleep $looptime;
+    my $now = time;
+
+    if ( keys %{$child_stash} ) {
+        my @dead_children = get_dead_children();
+        for my $child ( @dead_children ) {
+            my $proc = $child_stash->{$child}{pid};
+            log_message( scalar( localtime( $now ) ), " - offender exited: \n" );
+            log_message( '  ', proc_str( $offending_stash->{$proc} ), "\n" );
+            delete $offending_stash->{$proc};
+            delete $child_stash->{$child};
+        }
+    }
+
+    $watching_stash = update_watching_stash( $watching_stash, $now );
+
+    my @offenders = grep { $now - $_->{tag_time} > $delaytime } values( %{$watching_stash} );
+
+    if ( @offenders ) {
+        for my $proc ( @offenders ) {
+            if ( grep {m/^ $proc->{user} $/x} @ignored_users ) {
+
+                # doesn't apply to ignored users
+                next;
+            }
+            unless ( grep {m/^ $proc->{comm} /xi} @limit_commands ) {
+
+                # only limit common offenders
+                next;
+            }
+            if ( $offending_stash->{ $proc->{pid} } ) {
+
+                # already got this one
+                next;
+            }
+            log_message( scalar( localtime( $now ) ), " - limiting offender: \n" );
+            log_message( '  ', proc_str( $proc ), "\n" );
+            my $child = limit( $proc->{pid} );
+            $offending_stash->{ $proc->{pid} } = $proc;
+            $child_stash->{$child} = $proc;
+        }
+    }
+}

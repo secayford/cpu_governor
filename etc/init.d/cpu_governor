@@ -1,0 +1,58 @@
+#! /bin/sh
+
+### BEGIN INIT INFO
+# Provides:		cpu_governor
+# Required-Start:	$syslog
+# Required-Stop:	$syslog
+# Default-Start:	2 3 4 5
+# Default-Stop:		1
+# Short-Description:	CPU Governor for LTSP server by Steve
+### END INIT INFO
+
+set -e
+
+test -x /usr/local/bin/cpu_governor || exit 0
+
+. /lib/lsb/init-functions
+
+# Are we running from init?
+run_by_init() {
+    ([ "$previous" ] && [ "$runlevel" ]) || [ "$runlevel" = S ]
+}
+
+export PATH="${PATH:+$PATH:}/usr/sbin:/sbin"
+
+case "$1" in
+  start)
+	log_daemon_msg "Starting CPU Governor" "cpu_governor"
+	if start-stop-daemon --start --quiet --oknodo --pidfile /var/run/cpu_governor.pid --background --make-pidfile --exec /usr/local/bin/cpu_governor ; then
+	    log_end_msg 0
+	else
+	    log_end_msg 1
+	fi
+	;;
+  stop)
+	log_daemon_msg "Stopping CPU Governor" "cpu_governor"
+	if start-stop-daemon --stop --quiet --oknodo --pidfile /var/run/cpu_governor.pid; then
+	    log_end_msg 0
+	else
+	    log_end_msg 1
+	fi
+	;;
+
+  restart)
+	log_daemon_msg "Restarting CPU Governor" "cpu_governor"
+	start-stop-daemon --stop --quiet --oknodo --retry 30 --pidfile /var/run/cpu_governor.pid
+	if start-stop-daemon --start --quiet --oknodo --pidfile /var/run/cpu_governor.pid --background --make-pidfile --exec /usr/local/bin/cpu_governor ; then
+	    log_end_msg 0
+	else
+	    log_end_msg 1
+	fi
+	;;
+
+  *)
+	log_action_msg "Usage: /etc/init.d/cpu_governor {start|stop|restart}"
+	exit 1
+esac
+
+exit 0

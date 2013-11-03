@@ -1,0 +1,9 @@
+Changes
+MANIFEST			This list of files
+LICENSE
+README
+README.md
+bin/cpu_governor
+etc/init.d/cpu_governor
+t/manifest.t
+
